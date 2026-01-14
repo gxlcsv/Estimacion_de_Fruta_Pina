@@ -1,0 +1,263 @@
+# ==============================================================================
+# PROYECTO PIÑA 360 - Versión para Despliegue (Posit Connect)
+# ==============================================================================
+
+# 1. Configuraciones de Servidor
+# Aumentar límite de carga a 200MB (Crucial para GeoPackages grandes en la nube)
+options(shiny.maxRequestSize = 200 * 1024^2)
+
+# 2. Carga de Librerías
+# Nota: Posit Connect detectará estas líneas e instalará automáticamente 
+# las dependencias de sistema (GDAL, GEOS, PROJ) necesarias para 'sf'.
+library(shiny)
+library(sf)
+library(dplyr)
+library(leaflet)
+library(plotly)
+library(DT)
+library(stringr)
+
+# Instala rsconnect si no lo tienes
+if (!require("rsconnect")) install.packages("rsconnect")
+
+# Genera el archivo manifest
+rsconnect::writeManifest(appPrimaryDoc = "app.R")
+
+# --- Funciones Auxiliares (Helpers) ---
+norm_name <- function(x) tolower(str_trim(x))
+
+pick_col <- function(nms, candidates) {
+  nms_norm <- norm_name(nms); cand_norm <- norm_name(candidates)
+  hit <- match(cand_norm, nms_norm); hit <- hit[!is.na(hit)]
+  if (length(hit) == 0) return(NULL)
+  nms[hit[1]]
+}
+
+safe_numeric <- function(x) {
+  if (is.numeric(x)) return(x)
+  x2 <- gsub("\\s+|,", "", as.character(x))
+  suppressWarnings(as.numeric(x2))
+}
+
+fmt_int <- function(x) format(round(na.omit(x)), big.mark = ",", scientific = FALSE)
+
+# --- Interfaz de Usuario (UI) ---
+ui <- shiny::fluidPage(
+  shiny::tags$head(shiny::tags$style(shiny::HTML("
+      .header-bar{ margin: 20px 0; border-bottom: 2px solid #f0f0f0; padding-bottom: 10px; }
+      .metric-box{ padding: 15px; border-radius: 10px; background: #fff; border: 1px solid #eee; margin-bottom: 15px;}
+      .metric-title{ font-size: 11px; color: #7f8c8d; font-weight: bold; text-transform: uppercase; }
+      .metric-value{ font-size: 18px; font-weight: 800; color: #2c3e50; }
+      /* Estilo para que los gráficos no se vean cortados */
+      .plotly { margin-top: 20px; }
+  "))),
+  
+  shiny::tags$div(class = "header-bar", 
+                  shiny::tags$h2("Proyecto Piña 360: Auditoría de Cosecha")),
+  
+  shiny::sidebarLayout(
+    shiny::sidebarPanel(
+      shiny::helpText("Bienvenido al sistema de auditoría. Por favor, cargue su archivo .gpkg para comenzar."),
+      shiny::fileInput("gpkg", "1. Cargar geopackage (.gpkg)", accept = ".gpkg"),
+      shiny::uiOutput("layer_ui"),
+      shiny::selectInput("bloque_sel", "2. Seleccionar bloque", choices = "Todos"),
+      shiny::hr(),
+      shiny::sliderInput("densidad_ideal", "Densidad Objetivo (Plantas/ha)", 30000, 80000, 75000, step = 100),
+      shiny::sliderInput("perdida", "Pérdida de plantas (%)", 0, 30, 10),
+      width = 3
+    ),
+    
+    shiny::mainPanel(
+      shiny::fluidRow(
+        shiny::column(3, shiny::div(class="metric-box", shiny::div(class="metric-title","Cosecha Ideal"), shiny::div(class="metric-value", style="color:#2563EB", shiny::textOutput("m_total_ideal")))),
+        shiny::column(3, shiny::div(class="metric-box", shiny::div(class="metric-title","Cosecha Real"), shiny::div(class="metric-value", style="color:#9333ea", shiny::textOutput("m_total_real")))),
+        shiny::column(3, shiny::div(class="metric-box", shiny::div(class="metric-title","Precisión GXL"), shiny::div(class="metric-value", shiny::textOutput("m_acc_gxl")))),
+        shiny::column(3, shiny::div(class="metric-box", shiny::div(class="metric-title","Precisión Manual"), shiny::div(class="metric-value", shiny::textOutput("m_acc_man"))))
+      ),
+      
+      shiny::tabsetPanel(
+        shiny::tabPanel("Mapa Interactivo", leaflet::leafletOutput("map", height = "600px")),
+        shiny::tabPanel("Comparativa de Volúmenes", plotly::plotlyOutput("plot_compare", height = "500px")),
+        shiny::tabPanel("Análisis de Densidad", plotly::plotlyOutput("plot_densidad", height = "500px")),
+        shiny::tabPanel("Análisis de Errores", plotly::plotlyOutput("plot_error", height = "500px")),
+        shiny::tabPanel("Base de Datos", shiny::div(style="margin-top:20px", DT::DTOutput("tbl")))
+      ), width = 9
+    )
+  )
+)
+
+# --- Lógica del Servidor (Server) ---
+server <- function(input, output, session) {
+  
+  # Lectura del archivo cargado
+  sf_raw <- reactive({
+    req(input$gpkg, input$layer)
+    sf::st_read(input$gpkg$datapath, layer = input$layer, quiet = TRUE)
+  })
+  
+  # UI Dinámica para las capas del GPKG
+  output$layer_ui <- renderUI({
+    req(input$gpkg)
+    layers <- sf::st_layers(input$gpkg$datapath)$name
+    shiny::selectInput("layer", "Capa a cargar", choices = layers)
+  })
+  
+  # Procesamiento de Datos
+  data_ready_all <- reactive({
+    df <- sf_raw()
+    nms <- names(df)
+    
+    # Mapeo flexible de columnas
+    col_nombre     <- pick_col(nms, c("nombre", "name", "bloque", "block"))
+    col_area       <- pick_col(nms, c("area", "hectareas", "ha"))
+    col_plantas    <- pick_col(nms, c("numpoints", "plantas", "plants"))
+    col_manual     <- pick_col(nms, c("estimacion", "manual", "est_manual"))
+    col_gxl        <- pick_col(nms, c("gxl", "est_gxl"))
+    col_real       <- pick_col(nms, c("cosecha", "real", "harvest"))
+    col_dens_real  <- pick_col(nms, c("densidad", "density", "dens"))
+    
+    res <- df %>%
+      dplyr::mutate(
+        Bloque = as.character(.data[[col_nombre]]),
+        Area_Ha = safe_numeric(.data[[col_area]]),
+        Plantas = if(!is.null(col_plantas)) safe_numeric(.data[[col_plantas]]) else NA_real_,
+        Manual  = if(!is.null(col_manual))  safe_numeric(.data[[col_manual]])  else NA_real_,
+        GXL     = if(!is.null(col_gxl))     safe_numeric(.data[[col_gxl]])     else NA_real_,
+        Real    = if(!is.null(col_real))    safe_numeric(.data[[col_real]])    else NA_real_,
+        Dens_Real  = if(!is.null(col_dens_real)) safe_numeric(.data[[col_dens_real]]) else 0,
+        Dens_Ideal = input$densidad_ideal,
+        Diff_Dens  = abs((Dens_Real - Dens_Ideal) / Dens_Ideal),
+        Color_Dens = ifelse(Diff_Dens > 0.15, "#EF4444", "#10B981"),
+        Ideal   = Area_Ha * input$densidad_ideal * (1 - (input$perdida/100)),
+        Err_GXL = round(((GXL - Real) / Real) * 100, 2),
+        Err_Man = round(((Manual - Real) / Real) * 100, 2)
+      ) %>%
+      sf::st_transform(4326)
+    
+    # Ordenar bloques numéricamente
+    res <- res %>% 
+      mutate(num_id = as.numeric(str_extract(Bloque, "\\d+"))) %>% 
+      arrange(num_id) %>%
+      mutate(Bloque = factor(Bloque, levels = unique(Bloque)))
+    
+    res
+  })
+  
+  # Actualización del selector de bloques
+  observe({
+    req(input$gpkg)
+    df <- data_ready_all()
+    shiny::updateSelectInput(session, "bloque_sel", choices = c("Todos", levels(df$Bloque)))
+  })
+  
+  # Filtrado final
+  data_ready <- reactive({
+    df <- data_ready_all()
+    if (input$bloque_sel != "Todos") df <- df %>% dplyr::filter(Bloque == input$bloque_sel)
+    df
+  })
+  
+  # --- Renderizado de Outputs ---
+  
+  output$m_total_ideal <- renderText({ req(input$gpkg); fmt_int(sum(data_ready()$Ideal, na.rm=T)) })
+  output$m_total_real  <- renderText({ req(input$gpkg); fmt_int(sum(data_ready()$Real, na.rm=T)) })
+  
+  output$m_acc_gxl <- renderText({
+    req(input$gpkg)
+    r <- sum(data_ready()$Real, na.rm=T); g <- sum(data_ready()$GXL, na.rm=T)
+    if(is.na(r) || r==0) return("0%")
+    paste0(round(100 - abs((g-r)/r*100), 1), "%")
+  })
+  
+  output$m_acc_man <- renderText({
+    req(input$gpkg)
+    r <- sum(data_ready()$Real, na.rm=T); m <- sum(data_ready()$Manual, na.rm=T)
+    if(is.na(r) || r==0) return("0%")
+    paste0(round(100 - abs((m-r)/r*100), 1), "%")
+  })
+  
+  output$map <- leaflet::renderLeaflet({
+    # Mapa base vacío si no hay archivo
+    if (!isTruthy(input$gpkg)) {
+      return(leaflet::leaflet() %>% leaflet::addProviderTiles("Esri.WorldImagery") %>% leaflet::setView(0,0,2))
+    }
+    
+    df <- data_ready()
+    pal <- leaflet::colorNumeric(palette = "RdYlGn", domain = c(-30, 30), reverse = FALSE)
+    
+    leaflet::leaflet(df) %>%
+      leaflet::addProviderTiles("Esri.WorldImagery") %>%
+      leaflet::addPolygons(
+        fillColor = ~pal(Err_GXL), fillOpacity = 0.7, weight = 2, color = "white",
+        popup = ~paste0(
+          "<div style='font-family: Arial; min-width: 220px;'>",
+          "<h4 style='margin:0 0 10px 0;'>Bloque: ", Bloque, "</h4>",
+          "<b>N° Plantas:</b> ", fmt_int(Plantas), "<br>",
+          "<b>Cosecha Ideal:</b> ", fmt_int(Ideal), "<br>",
+          "<b>Cosecha Real:</b> ", fmt_int(Real), "<hr style='margin:5px 0'>",
+          "<b>Est. Manual:</b> ", fmt_int(Manual), " (", Err_Man, "%)<br>",
+          "<b>Est. GXL:</b> ", fmt_int(GXL), " (", Err_GXL, "%)",
+          "</div>"
+        )
+      ) %>%
+      leaflet::addLegend(pal = pal, values = c(-30, 30), title = "% Error GXL", position = "bottomright")
+  })
+  
+  output$plot_densidad <- plotly::renderPlotly({
+    req(input$gpkg)
+    df <- data_ready() %>% sf::st_drop_geometry()
+    plotly::plot_ly(df, x = ~Bloque) %>%
+      plotly::add_bars(y = ~Dens_Ideal, name = "Densidad Ideal", marker = list(color = '#1E293B')) %>%
+      plotly::add_bars(y = ~Dens_Real, name = "Densidad Real", marker = list(color = ~Color_Dens)) %>%
+      plotly::layout(
+        title = list(text = "Análisis de Densidad (Real vs Ideal)", y = 0.98),
+        barmode = 'group', margin = list(t = 100, b = 80),
+        xaxis = list(title = "Bloque"), yaxis = list(title = "Plantas / Ha"),
+        legend = list(orientation = 'h', y = -0.2)
+      )
+  })
+  
+  output$plot_compare <- plotly::renderPlotly({
+    req(input$gpkg)
+    df <- data_ready() %>% sf::st_drop_geometry()
+    plotly::plot_ly(df, x = ~Bloque) %>%
+      plotly::add_bars(y = ~Ideal, name = "Ideal", marker = list(color = '#2563EB')) %>%
+      plotly::add_bars(y = ~Manual, name = "Manual", marker = list(color = '#F97316')) %>%
+      plotly::add_bars(y = ~GXL, name = "GXL", marker = list(color = '#FACC15')) %>%
+      plotly::add_bars(y = ~Real, name = "Real", marker = list(color = '#9333ea')) %>%
+      plotly::layout(
+        title = list(text = "Comparativa de Volúmenes de Cosecha", y = 0.98),
+        barmode = 'group', margin = list(t = 100, b = 80),
+        xaxis = list(title = "Bloque"), yaxis = list(title = "Frutas"),
+        legend = list(orientation = 'h', y = -0.2)
+      )
+  })
+  
+  output$plot_error <- plotly::renderPlotly({
+    req(input$gpkg)
+    df <- data_ready() %>% sf::st_drop_geometry()
+    plotly::plot_ly(df, x = ~Bloque) %>%
+      plotly::add_bars(y = ~Err_GXL, name = "% Error GXL", marker = list(color = '#FACC15')) %>%
+      plotly::add_bars(y = ~Err_Man, name = "% Error Manual", marker = list(color = '#F97316')) %>%
+      plotly::layout(
+        title = list(text = "Análisis de Desviación (% de Error)", y = 0.98),
+        margin = list(t = 100, b = 80), yaxis = list(title = "% Desviación"),
+        xaxis = list(title = "Bloque"), barmode = 'group',
+        legend = list(orientation = 'h', y = -0.2)
+      )
+  })
+  
+  output$tbl <- DT::renderDT({
+    req(input$gpkg)
+    data_ready() %>% sf::st_drop_geometry() %>%
+      dplyr::select(Bloque, Dens_Real, Dens_Ideal, Ideal, Manual, GXL, Real, `Err GXL %` = Err_GXL, `Err Man %` = Err_Man) %>%
+      DT::datatable(
+        extensions = 'Buttons',
+        options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print'), scrollX = TRUE, pageLength = 15)
+      ) %>%
+      DT::formatRound(columns = c('Dens_Real', 'Dens_Ideal', 'Ideal', 'Manual', 'GXL', 'Real'), digits = 0)
+  })
+}
+
+# --- Ejecución ---
+shinyApp(ui, server)
